@@ -6,6 +6,13 @@ compile command
 ===============
     g++ -std=c++11 *.cpp -lcouchbase -levent -lcrypto -o test
 
+environment
+===========
+    g++ 4.8.1
+    libcouchbase-2.2.0
+    couchbase-server 2.2.0 community or enterprise
+    ubuntu 13.04 desktop
+
 1.build required
     json            directory that contain jsoncpp's header
     jsoncpp.cpp     jsoncpp's implement
