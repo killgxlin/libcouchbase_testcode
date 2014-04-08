@@ -19,15 +19,10 @@ environment
     main.cpp        my test code
 
 2.other files
-    key_863.base64  base64 encoded of document mutated
-    key_863.json    document mutated. contains some unprintable character, it's better to view with hexdump
-    key_863.dump    hexdump of key_863.json
+    key_*.base64    base64 encoded of document mutated
+    key_*.json      document mutated. contains some unprintable character, it's better to view with hexdump
+    key_*.dump      hexdump of key_*.json
 
-3.test_view
-    path:
-        /default/_design/check/_view/check
-    map:
-        function (doc, meta) {
-          if (meta.type == "base64")
-            emit(meta.id, null);
-        }
+3.executable
+    test            used for test
+    net_confuser    used for enumate the the unstable network
