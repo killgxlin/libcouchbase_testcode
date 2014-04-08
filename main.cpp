@@ -8,49 +8,45 @@
 #include <openssl/md5.h>
 #include "json/json.h"
 
-static int32_t random(int32_t cbegin, int32_t cend);
 static const char* fmt_cstr(const char* fmt, ...);
 static const char* to_cstr(const Json::Value &json);
-static std::string fmt_str(const char* fmt, ...);
 static Json::Value to_json(const char* str);
 static void on_signal(int32_t sig, void(*handler)(int));
 static const char* Md5(const char* str);
 static const char* hex_to_cstr(uint8_t* buf, int len);
 
-static int DATASIZEMIN = 100;
-static int DATASIZEMAX = 10000;
-static int DOCNUM = 1000;
-static int TOTALDOCNUM = 100000;
+static const int DOCNUM = 10000;
+static const int DOCSIZE = 1024 * 16;
 
 enum state_t {
-	Null = -1,      // uninitialized may be just started or destroied
-	Initing = 0,    // initing
-	Running = 1,    // good status
-	Destroying = 2, // it may be some mistake so need destroy for next initing
+	Null = -1,
+	Initing = 0,
+	Running = 1,
+	Destroying = 2,
 };
 
-static state_t s_state = Null;
-static int s_pending_get = 0;
-static int s_pending_set = 0;
-static int s_pending_conf = 0;
-static lcb_t s_inst = NULL;
+static int 			s_pending_view = 0;
+static int 			s_pending_set = 0;
+static int 			s_pending_conf = 0;
+
+static bool 		s_run = true;
+static lcb_t 		s_inst = NULL;
+static state_t 		s_state = Null;
+static Json::Value 	s_json;
 
 static lcb_io_opt_t create_libevent_io_ops(struct event_base *evbase);
-static void create_instance(lcb_io_opt_t ioops);
-static void destroy_instance();
+static void 		create_instance(lcb_io_opt_t ioops);
+static void 		destroy_instance();
+static void 		emit_sets();
+static void 		emit_check();
+static void 		gen_json();
 
-static void gen_data(int seed, Json::Value &data);
-static bool check_data(const Json::Value &data);
-
-static bool run = true;
 static void handle_ctrl_c(int signal) {
-    run = false;
+    s_run = false;
     s_state = Destroying;
 }
 
-
-int main(int argc, char** argv) {
-
+int main() {
     on_signal(SIGINT, handle_ctrl_c);
 
     struct event_base *evbase = event_base_new();
@@ -59,48 +55,30 @@ int main(int argc, char** argv) {
 	while (true) {
 		switch (s_state) {
 		case Null:
-		    assert(s_pending_conf == 0 && s_pending_set == 0 && s_pending_get == 0);
+		    assert(s_pending_conf == 0 && s_pending_set == 0 && s_pending_view == 0);
 		    create_instance(ioops);
 			break;
 		case Running:
-			if (s_pending_conf == 0 && s_pending_get == 0 && s_pending_set == 0) {
-				Json::Value data;
-				for (int i=0; i<DOCNUM; ++i) {
-					gen_data(i, data);
-
-					std::string value = to_cstr(data);
-					std::string key = fmt_cstr("key:%d", i);
-
-					lcb_store_cmd_t cmd(LCB_SET, key.c_str(), key.length(), value.c_str(), value.length());
-					lcb_store_cmd_t *cmds[] = {&cmd};
-
-					lcb_error_t err = lcb_store(s_inst, NULL, 1, cmds);
-					if (err == LCB_SUCCESS) {
-						++s_pending_set;
-					} else {
-						fprintf(stderr, "Failed to set up store request: %s\n", lcb_strerror(s_inst, err));
-					    s_state = Destroying;
-					    break;
-					}
-				}
-			}
+			if (s_pending_conf == 0 && s_pending_view == 0 && s_pending_set == 0)
+				emit_check();
 
 			break;
 		case Destroying:
-			if (s_pending_conf == 0 && s_pending_get == 0 && s_pending_set == 0) {
+			if (s_pending_conf == 0 && s_pending_view == 0 && s_pending_set == 0) {
 				destroy_instance();
-				if (!run)
+				if (!s_run)
 					goto finish;
 			}
 			break;
+        default:
+            break;
 		}
-		event_base_loop(evbase, EVLOOP_NONBLOCK);
-		usleep(1000*100);
+		event_base_loop(evbase, EVLOOP_ONCE);
 		printf("status:%d\n", s_state);
-		printf("pending\n\tconf:%d\n\tset:%d\n\tget:%d\n",
+		printf("pending\n\tconf:%d\n\tset:%d\n\tview:%d\n",
 				s_pending_conf,
 				s_pending_set,
-				s_pending_get);
+				s_pending_view);
 		printf("____________________\n");
 	}
 
@@ -110,7 +88,6 @@ finish:
     event_base_free(evbase);
 
     printf("pace finish\n");
-	return true;
 }
 
 static void error_callback(lcb_t instance,
@@ -126,65 +103,8 @@ static void configuration_callback(lcb_t instance, lcb_configuration_t config)
 	s_pending_conf = 0;
 	s_state = Running;
 
-	if (s_pending_conf == 0 && s_pending_get == 0 && s_pending_set == 0) {
-		Json::Value data;
-		for (int i=0; i<DOCNUM; ++i) {
-			gen_data(i, data);
-
-			std::string value = to_cstr(data);
-			std::string key = fmt_cstr("key:%d", i);
-
-			lcb_store_cmd_t cmd(LCB_SET, key.c_str(), key.length(), value.c_str(), value.length());
-			lcb_store_cmd_t *cmds[] = {&cmd};
-
-			lcb_error_t err = lcb_store(instance, NULL, 1, cmds);
-			if (err == LCB_SUCCESS) {
-				++s_pending_set;
-			} else {
-				fprintf(stderr, "Failed to set up store request: %s\n", lcb_strerror(instance, err));
-				s_state = Destroying;
-				break;
-			}
-		}
-	}
-}
-
-static void get_callback(lcb_t instance,
-                         const void *cookie,
-                         lcb_error_t error,
-                         const lcb_get_resp_t *resp)
-{
-	--s_pending_get;
-
-	assert(s_state == Running || s_state == Destroying);
-
-	if (error != LCB_SUCCESS) {
-        fprintf(stderr, "Failed to get key: %s\n", lcb_strerror(instance, error));
-    } else {
-    	std::string str((char*)resp->v.v0.bytes, resp->v.v0.nbytes);
-    	Json::Value data = to_json(str.c_str());
-    	assert(check_data(data));
-    	if (s_pending_get == 0 && s_state == Running) {
-    		for (int i=0; i<DOCNUM; ++i) {
-    			gen_data(i, data);
-
-    			std::string value = to_cstr(data);
-    			std::string key = fmt_cstr("key:%d", i);
-
-    			lcb_store_cmd_t cmd(LCB_SET, key.c_str(), key.length(), value.c_str(), value.length());
-    			lcb_store_cmd_t *cmds[] = {&cmd};
-
-        		lcb_error_t err = lcb_store(instance, NULL, 1, cmds);
-        		if (err == LCB_SUCCESS) {
-        			++s_pending_set;
-        		} else {
-        			fprintf(stderr, "Failed to set up store request: %s\n", lcb_strerror(instance, err));
-        		    s_state = Destroying;
-        		    break;
-        		}
-    		}
-    	}
-    }
+	if (s_state == Running && s_pending_set == 0 && s_pending_conf == 0 && s_pending_view == 0)
+		emit_check();
 }
 
 static void store_callback(lcb_t instance,
@@ -198,27 +118,37 @@ static void store_callback(lcb_t instance,
 	assert(s_state == Running || s_state == Destroying);
 
     if (error != LCB_SUCCESS) {
-        fprintf(stderr, "Failed to store key: %s\n", lcb_strerror(instance, error));
+        //fprintf(stderr, "Failed to store key: %s\n", lcb_strerror(instance, error));
     } else {
     	if (s_state == Running && s_pending_set == 0) {
-    		for (int i=0; i<DOCNUM; ++i) {
-    			std::string key = fmt_cstr("key:%d", i);
-
-                lcb_get_cmd_t cmd(key.c_str(), key.length());
-                lcb_get_cmd_t *cmds[] = {&cmd};
-
-                lcb_error_t err = lcb_get(instance, NULL, 1, cmds);
-                if (err == LCB_SUCCESS) {
-                	++s_pending_get;
-                } else {
-                    fprintf(stderr, "Failed to setup get request: %s\n", lcb_strerror(instance, error));
-            	    s_state = Destroying;
-            	    break;
-                }
-    		}
+    		emit_check();
     	}
     }
 }
+
+static void view_callback(
+		lcb_http_request_t request,
+		lcb_t conn,
+		const void *cookie,
+		lcb_error_t error,
+		const lcb_http_resp_t *resp)
+{
+	--s_pending_view;
+
+	assert(s_state == Running || s_state == Destroying);
+
+    if (error != LCB_SUCCESS) {
+        //fprintf(stderr, "Failed to store key: %s\n", lcb_strerror(s_inst, error));
+    } else {
+    	std::string str((const char*)resp->v.v0.bytes, resp->v.v0.nbytes);
+    	Json::Value view_json = to_json(str.c_str());
+    	assert(view_json["total_rows"].asInt() == 0);
+    	if (s_state == Running && s_pending_view == 0)
+    		emit_sets();
+    }
+}
+
+
 
 static lcb_io_opt_t create_libevent_io_ops(struct event_base *evbase)
 {
@@ -253,23 +183,23 @@ static void create_instance(lcb_io_opt_t ioops) {
 	assert(s_state == Null && s_inst == NULL);
 
     lcb_t instance;
-    lcb_error_t error;
     lcb_create_st copts("192.168.1.3", "", "", "", ioops);
     lcb_error_t err = lcb_create(&instance, &copts);
     if (err != LCB_SUCCESS) {
-        fprintf(stderr, "Failed to create a libcouchbase instance: %s\n", lcb_strerror(NULL, error));
+        fprintf(stderr, "Failed to create a libcouchbase instance: %s\n", lcb_strerror(NULL, err));
         exit(EXIT_FAILURE);
     }
 
     /* Set up the callbacks */
     lcb_set_error_callback(instance, error_callback);
     lcb_set_configuration_callback(instance, configuration_callback);
-    lcb_set_get_callback(instance, get_callback);
     lcb_set_store_callback(instance, store_callback);
+    lcb_set_http_complete_callback(instance, view_callback);
+    lcb_set_timeout(instance, 1000 * 1000 * 3);
 
     err = lcb_connect(instance);
     if (err != LCB_SUCCESS) {
-        fprintf(stderr, "Failed to connect libcouchbase instance: %s\n", lcb_strerror(NULL, error));
+        fprintf(stderr, "Failed to connect libcouchbase instance: %s\n", lcb_strerror(NULL, err));
         lcb_destroy(instance);
         return;
     }
@@ -279,18 +209,55 @@ static void create_instance(lcb_io_opt_t ioops) {
     s_state = Initing;
 }
 
-static void gen_data(int seed, Json::Value &data) {
-	char buffer[DATASIZEMAX+1];
-	int len = random(DATASIZEMIN, DATASIZEMAX);
-	for (int i=0; i<len; ++i) {
-		buffer[i] = 48 + i % (125-48);
+static void emit_sets() {
+	gen_json();
+
+	for (int i=0; i<DOCNUM; ++i) {
+		std::string value = to_cstr(s_json);
+		std::string key = fmt_cstr("key:%d", i);
+
+		lcb_store_cmd_t cmd(LCB_SET, key.c_str(), key.length(), value.c_str(), value.length());
+		lcb_store_cmd_t *cmds[] = {&cmd};
+
+		lcb_error_t err = lcb_store(s_inst, NULL, 1, cmds);
+		if (err == LCB_SUCCESS) {
+		    ++s_pending_set;
+		} else {
+		    fprintf(stderr, "Failed to set up store request: %s\n", lcb_strerror(s_inst, err));
+		    s_state = Destroying;
+		    break;
+		}
 	}
-	buffer[len] = 0;
-	data["data"] = buffer;
-	data["md5"] = Md5(buffer);
 }
-static bool check_data(const Json::Value &data) {
-	return data["md5"].asString() == Md5(data["data"].asCString());
+
+static void emit_check() {
+	const char* path = "/_design/check/_view/check?stale=false&connection_timeout=60000";
+	lcb_http_request_t req;
+    lcb_http_cmd_t cmd(path, strlen(path), NULL, 0, LCB_HTTP_METHOD_GET, 0, "application/json");
+
+    lcb_error_t err = lcb_make_http_request(s_inst, NULL, LCB_HTTP_TYPE_VIEW, &cmd, &req);
+	if (err == LCB_SUCCESS) {
+		++s_pending_view;
+	} else {
+		fprintf(stderr, "Failed to setup view request: %s\n", lcb_strerror(s_inst, err));
+		s_state = Destroying;
+		return;
+	}
+}
+
+static void gen_json() {
+	static char buffer[DOCSIZE];
+	static bool inited = false;
+	if (inited)
+		return;
+
+	inited = true;
+	for (int i=0; i<DOCSIZE - 1; ++i)
+		buffer[i] = '0' + i % 10;
+	buffer[DOCSIZE - 1] = 0;
+
+	s_json["data"] = buffer;
+	s_json["checksum"] = Md5(buffer);
 }
 
 
@@ -336,10 +303,6 @@ static void on_signal(int32_t sig, void(*handler)(int)) {
 static const char* Md5(const char* str) {
     uint8_t* buf = MD5((uint8_t*)str, strlen(str), NULL);
     return hex_to_cstr(buf, 16);
-}
-
-static int32_t random(int32_t cbegin, int32_t cend) {
-    return cbegin + rand()%(cend - cbegin + 1);
 }
 
 static const char* hex_to_cstr(uint8_t* buf, int len) {

@@ -1,0 +1,20 @@
+#!/bin/bash
+
+STATUS=UP
+while [ true ]
+do
+    if [ "$STATUS" == "UP" ] 
+    then
+        ifconfig eth0 down &>/dev/null
+        STATUS=DOWN
+        RANGE=3
+    else
+        ifconfig eth0 up &>/dev/null
+        STATUS=UP
+        RANGE=10
+    fi
+    echo $STATUS
+    number=$RANDOM
+    let "number %= $RANGE"
+    sleep $number
+done
